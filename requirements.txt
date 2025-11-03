@@ -1,0 +1,5 @@
+edgex-python-sdk
+httpx[http2]
+loguru
+PyYAML
+python-dotenv
