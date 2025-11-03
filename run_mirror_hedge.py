@@ -122,6 +122,124 @@ async def get_market_rules(base_url: str, contract_id: str) -> Dict[str, float]:
     return rules
 
 
+async def get_ticker_mid_price(base_url: str, contract_id: str) -> Optional[float]:
+    """Fetch mid price using public ticker endpoint. Returns None on failure.
+
+    Tries common fields: bestBidPrice/bestAskPrice, bid/ask, lastPrice, price.
+    """
+    base = (base_url or "").rstrip("/")
+    url = f"{base}/api/v1/public/quote/getTicker?contractId={contract_id}"
+    try:
+        async with httpx.AsyncClient(timeout=6.0, headers={"Accept": "application/json"}) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            body = r.json()
+            data = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(data, dict):
+                return None
+            # Common fields
+            bid = data.get("bestBidPrice") or data.get("bid") or data.get("bestBid")
+            ask = data.get("bestAskPrice") or data.get("ask") or data.get("bestAsk")
+            last = data.get("lastPrice") or data.get("price") or data.get("last")
+
+            def _f(x: Any) -> Optional[float]:
+                try:
+                    if x is None:
+                        return None
+                    return float(str(x))
+                except Exception:
+                    return None
+
+            b = _f(bid)
+            a = _f(ask)
+            if b and a and b > 0 and a > 0:
+                return (b + a) / 2.0
+            l = _f(last)
+            return l if (l and l > 0) else None
+    except Exception:
+        return None
+
+
+async def fetch_unrealized_pnl(
+    client: EdgeXClient, account_id: int, contract_id: str
+) -> Optional[float]:
+    """Try to fetch unrealized PnL for a specific account+contract.
+
+    Returns positive for profit, negative for loss. None if unavailable.
+    """
+    candidates: List[Tuple[str, str]] = [
+        ("account", "get_position_page"),
+        ("account", "get_positions"),
+        ("account", "get_account_positions"),
+        ("position", "get_position_page"),
+        ("position", "get_positions"),
+        ("", "get_positions"),
+    ]
+    resp: Any = None
+    for ns, fn in candidates:
+        try:
+            target = getattr(client, ns) if ns else client
+            if not hasattr(target, fn):
+                continue
+            method = getattr(target, fn)
+            # common param variants
+            param_variants = [
+                {"accountId": str(account_id), "contractId": str(contract_id), "size": "200"},
+                {"accountId": str(account_id), "contractIdList": [str(contract_id)], "size": "200"},
+                {"account_id": account_id, "contract_id": str(contract_id), "size": 200},
+                {"params": {"accountId": str(account_id), "contractId": str(contract_id), "size": "200"}},
+            ]
+            for pv in param_variants:
+                try:
+                    resp = await method(**pv)  # type: ignore[arg-type]
+                    break
+                except TypeError:
+                    continue
+            if resp is None:
+                try:
+                    resp = await method(accountId=str(account_id))
+                except Exception:
+                    pass
+            if resp is not None:
+                break
+        except Exception:
+            continue
+
+    if resp is None:
+        return None
+    try:
+        rows = _extract_rows_generic(resp)
+    except Exception:
+        rows = []
+    pnl_total: float = 0.0
+    matched = False
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        cid = str(r.get("contractId") or r.get("symbol") or r.get("contract_id") or "")
+        if cid and cid != str(contract_id):
+            continue
+        matched = True
+        # common PnL keys across variants
+        for k in (
+            "unrealizedPnl",
+            "unRealizedPnl",
+            "unrealizedProfit",
+            "floatingProfit",
+            "profitAndLoss",
+            "pnl",
+        ):
+            v = r.get(k)
+            if v is not None:
+                try:
+                    pnl_total += float(str(v))
+                except Exception:
+                    pass
+                break
+    if not matched:
+        return None
+    return pnl_total
+
 def round_size_to_step(qty: float, rules: Dict[str, float]) -> float:
     step_env = os.getenv("EDGEX_SIZE_STEP")
     step = None
@@ -525,6 +643,7 @@ async def mirror_once(
     step_cap: float,
     *,
     ref_client: Optional[EdgeXClient] = None,
+    notional_trigger_usd: float = 0.0,
 ) -> None:
     # rules and price for rounding and optional notional guards
     rules = await get_market_rules(base_url, contract_id)
@@ -547,6 +666,29 @@ async def mirror_once(
     size = round_size_to_step(size, rules)
     if size <= 0:
         return
+
+    # 含み益/損でポリシーを分岐
+    ref_pnl = await fetch_unrealized_pnl(ref_client, ref_account_id, str(contract_id))
+    if ref_pnl is not None:
+        if ref_pnl > 0:
+            # 参照口座が含み益 → ヘッジは不要。既存ヘッジがあれば解除（自口座=0へ）。
+            target_gap = 0.0 - own_net
+            size = abs(target_gap)
+            size = round_size_to_step(size, rules)
+            if size <= 0:
+                return
+            side = "BUY" if target_gap > 0 else "SELL"
+            res = await place_market_order(client_own, str(contract_id), side, size)
+            logger.info("mirror close-hedge: cid={} side={} size={} pnl_ref={} -> {}", contract_id, side, size, ref_pnl, res)
+            return
+        # 含み損側のみ、閾値で新規ヘッジを許可
+        if notional_trigger_usd and notional_trigger_usd > 0:
+            price = await get_ticker_mid_price(base_url, str(contract_id))
+            if price is None:
+                return
+            notional = abs(gap) * float(price)
+            if notional < notional_trigger_usd:
+                return
 
     side = "BUY" if gap > 0 else "SELL"  # move own towards -ref
     res = await place_market_order(client_own, str(contract_id), side, size)
@@ -671,6 +813,10 @@ async def main() -> None:
         step_cap = float(os.getenv("MIRROR_STEP_MAX", cfg.get("mirror_step_max", 0.0)))
     except Exception:
         step_cap = 0.0
+    try:
+        notional_trigger_usd = float(os.getenv("MIRROR_NOTIONAL_TRIGGER_USD", cfg.get("mirror_notional_trigger_usd", 0.0)))
+    except Exception:
+        notional_trigger_usd = 0.0
 
     # sanity
     from urllib.parse import urlparse
@@ -722,6 +868,7 @@ async def main() -> None:
                         band,
                         step_cap,
                         ref_client=ref_client,
+                        notional_trigger_usd=notional_trigger_usd,
                     )
                 except Exception as e:
                     logger.warning("mirror for cid={} failed: {}", cid, e)
